@@ -1,0 +1,570 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import json
+import logging
+import os
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+from collections import defaultdict
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("insider_threat_detection.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("InsiderThreatDetection")
+
+class UserBehaviorAnalytics:
+    """
+    A class for analyzing user behavior to detect potential insider threats.
+    """
+    
+    def __init__(self, config_path="config.json"):
+        """
+        Initialize the User Behavior Analytics system.
+        
+        Parameters:
+        -----------
+        config_path : str
+            Path to the configuration file.
+        """
+        self.config = self._load_config(config_path)
+        self.user_profiles = {}
+        self.anomaly_scores = {}
+        self.alerts = []
+        
+    def _load_config(self, config_path):
+        """
+        Load configuration from a JSON file.
+        
+        Parameters:
+        -----------
+        config_path : str
+            Path to the configuration file.
+            
+        Returns:
+        --------
+        dict
+            Configuration settings.
+        """
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            logger.info(f"Configuration loaded from {config_path}")
+            return config
+        except FileNotFoundError:
+            logger.warning(f"Configuration file not found at {config_path}. Using default configuration.")
+            return {
+                "anomaly_detection": {
+                    "contamination": 0.05,
+                    "n_estimators": 100,
+                    "random_state": 42
+                },
+                "alert_threshold": 0.8,
+                "feature_weights": {
+                    "login_time_variance": 1.0,
+                    "file_access_count": 1.0,
+                    "after_hours_activity": 1.5,
+                    "failed_login_attempts": 2.0,
+                    "sensitive_data_access": 2.0
+                },
+                "working_hours": {
+                    "start": "09:00",
+                    "end": "17:00"
+                }
+            }
+    
+    def load_data(self, file_path):
+        """
+        Load user activity data from a CSV file.
+        
+        Parameters:
+        -----------
+        file_path : str
+            Path to the CSV file containing user activity data.
+            
+        Returns:
+        --------
+        pd.DataFrame
+            DataFrame containing user activity data.
+        """
+        try:
+            df = pd.read_csv(file_path)
+            logger.info(f"Data loaded from {file_path}, {len(df)} records found")
+            return df
+        except Exception as e:
+            logger.error(f"Error loading data from {file_path}: {str(e)}")
+            return pd.DataFrame()
+    
+    def preprocess_data(self, df):
+        """
+        Preprocess the user activity data.
+        
+        Parameters:
+        -----------
+        df : pd.DataFrame
+            DataFrame containing user activity data.
+            
+        Returns:
+        --------
+        pd.DataFrame
+            Preprocessed DataFrame.
+        """
+        if df.empty:
+            return df
+            
+        try:
+            # Convert timestamp to datetime
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            
+            # Extract date and time features
+            df['date'] = df['timestamp'].dt.date
+            df['time'] = df['timestamp'].dt.time
+            df['hour'] = df['timestamp'].dt.hour
+            df['day_of_week'] = df['timestamp'].dt.dayofweek
+            
+            # Determine if activity occurred after hours
+            work_start = datetime.strptime(self.config['working_hours']['start'], '%H:%M').time()
+            work_end = datetime.strptime(self.config['working_hours']['end'], '%H:%M').time()
+            df['after_hours'] = df.apply(lambda row: 1 if (row['time'] < work_start or row['time'] > work_end) else 0, axis=1)
+            
+            logger.info("Data preprocessing completed")
+            return df
+        except Exception as e:
+            logger.error(f"Error preprocessing data: {str(e)}")
+            return df
+    
+    def extract_features(self, df):
+        """
+        Extract features from preprocessed data for anomaly detection.
+        
+        Parameters:
+        -----------
+        df : pd.DataFrame
+            Preprocessed user activity data.
+            
+        Returns:
+        --------
+        pd.DataFrame
+            DataFrame with extracted features for each user.
+        """
+        if df.empty:
+            return pd.DataFrame()
+            
+        try:
+            features = []
+            
+            # Group data by user
+            grouped = df.groupby('user_id')
+            
+            for user_id, group in grouped:
+                # Calculate login time variance
+                if 'login' in group['action'].values:
+                    login_times = group[group['action'] == 'login']['hour']
+                    login_time_variance = login_times.var() if len(login_times) > 1 else 0
+                else:
+                    login_time_variance = 0
+                
+                # Count file accesses
+                file_access_count = group[group['action'].str.contains('file_access')].shape[0]
+                
+                # Count after hours activities
+                after_hours_activity = group['after_hours'].sum()
+                
+                # Count failed login attempts
+                failed_login_attempts = group[group['action'] == 'failed_login'].shape[0]
+                
+                # Count sensitive data accesses
+                sensitive_data_access = group[group['action'] == 'sensitive_data_access'].shape[0]
+                
+                # Create feature vector
+                feature = {
+                    'user_id': user_id,
+                    'login_time_variance': login_time_variance,
+                    'file_access_count': file_access_count,
+                    'after_hours_activity': after_hours_activity,
+                    'failed_login_attempts': failed_login_attempts,
+                    'sensitive_data_access': sensitive_data_access,
+                    'total_actions': len(group)
+                }
+                
+                features.append(feature)
+            
+            feature_df = pd.DataFrame(features)
+            logger.info(f"Features extracted for {len(feature_df)} users")
+            
+            return feature_df
+        except Exception as e:
+            logger.error(f"Error extracting features: {str(e)}")
+            return pd.DataFrame()
+    
+    def detect_anomalies(self, feature_df):
+        """
+        Detect anomalies in user behavior using Isolation Forest.
+        
+        Parameters:
+        -----------
+        feature_df : pd.DataFrame
+            DataFrame with extracted features for each user.
+            
+        Returns:
+        --------
+        pd.DataFrame
+            DataFrame with anomaly scores for each user.
+        """
+        if feature_df.empty:
+            return pd.DataFrame()
+            
+        try:
+            # Extract feature matrix (excluding user_id)
+            feature_cols = [col for col in feature_df.columns if col != 'user_id']
+            X = feature_df[feature_cols].values
+            
+            # Apply feature weights
+            weights = [self.config['feature_weights'].get(col, 1.0) for col in feature_cols]
+            X_weighted = X * np.array(weights)
+            
+            # Standardize features
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X_weighted)
+            
+            # Detect anomalies using Isolation Forest
+            iso_forest = IsolationForest(
+                contamination=self.config['anomaly_detection']['contamination'],
+                n_estimators=self.config['anomaly_detection']['n_estimators'],
+                random_state=self.config['anomaly_detection']['random_state']
+            )
+            
+            # Fit and predict
+            predictions = iso_forest.fit_predict(X_scaled)
+            anomaly_scores = iso_forest.decision_function(X_scaled)
+            
+            # Convert to anomaly score (higher is more anomalous)
+            anomaly_scores = 1 - (anomaly_scores + 0.5)
+            
+            # Add results to DataFrame
+            result_df = feature_df.copy()
+            result_df['anomaly_score'] = anomaly_scores
+            result_df['is_anomaly'] = [1 if pred == -1 else 0 for pred in predictions]
+            
+            # Sort by anomaly score in descending order
+            result_df = result_df.sort_values('anomaly_score', ascending=False)
+            
+            logger.info(f"Anomaly detection completed. {result_df['is_anomaly'].sum()} potential threats detected.")
+            
+            # Store anomaly scores
+            self.anomaly_scores = dict(zip(result_df['user_id'], result_df['anomaly_score']))
+            
+            return result_df
+        except Exception as e:
+            logger.error(f"Error detecting anomalies: {str(e)}")
+            return pd.DataFrame()
+    
+    def generate_alerts(self, anomaly_df):
+        """
+        Generate alerts for users whose behavior appears anomalous.
+        
+        Parameters:
+        -----------
+        anomaly_df : pd.DataFrame
+            DataFrame with anomaly scores for each user.
+            
+        Returns:
+        --------
+        list
+            List of alert dictionaries for potentially malicious users.
+        """
+        if anomaly_df.empty:
+            return []
+            
+        try:
+            alerts = []
+            
+            # Filter users based on anomaly score threshold
+            threshold = self.config['alert_threshold']
+            high_risk_users = anomaly_df[anomaly_df['anomaly_score'] >= threshold]
+            
+            for _, row in high_risk_users.iterrows():
+                user_id = row['user_id']
+                
+                # Create alert
+                alert = {
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'user_id': user_id,
+                    'anomaly_score': row['anomaly_score'],
+                    'risk_level': 'High' if row['anomaly_score'] >= 0.9 else 'Medium',
+                    'unusual_behaviors': []
+                }
+                
+                # Identify specific unusual behaviors
+                if row['login_time_variance'] > 5:
+                    alert['unusual_behaviors'].append('Irregular login times')
+                
+                if row['after_hours_activity'] > 5:
+                    alert['unusual_behaviors'].append('Significant after-hours activity')
+                
+                if row['failed_login_attempts'] > 3:
+                    alert['unusual_behaviors'].append('Multiple failed login attempts')
+                
+                if row['sensitive_data_access'] > 0:
+                    alert['unusual_behaviors'].append('Access to sensitive data')
+                
+                alerts.append(alert)
+            
+            self.alerts = alerts
+            logger.info(f"Generated {len(alerts)} alerts for potentially malicious users")
+            
+            return alerts
+        except Exception as e:
+            logger.error(f"Error generating alerts: {str(e)}")
+            return []
+    
+    def visualize_results(self, anomaly_df, output_dir='reports'):
+        """
+        Visualize the results of the anomaly detection.
+        
+        Parameters:
+        -----------
+        anomaly_df : pd.DataFrame
+            DataFrame with anomaly scores for each user.
+        output_dir : str
+            Directory to save the visualizations.
+        """
+        if anomaly_df.empty:
+            return
+            
+        try:
+            # Create output directory if it doesn't exist
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Plot anomaly scores for all users
+            plt.figure(figsize=(12, 6))
+            plt.bar(range(len(anomaly_df)), anomaly_df['anomaly_score'], color='skyblue')
+            plt.axhline(y=self.config['alert_threshold'], color='red', linestyle='--')
+            plt.xlabel('User Index')
+            plt.ylabel('Anomaly Score')
+            plt.title('Anomaly Scores for All Users')
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, 'anomaly_scores.png'))
+            
+            # Plot feature distribution for normal vs anomalous users
+            feature_cols = [col for col in anomaly_df.columns if col not in ['user_id', 'anomaly_score', 'is_anomaly', 'total_actions']]
+            
+            plt.figure(figsize=(15, 10))
+            for i, feature in enumerate(feature_cols):
+                plt.subplot(2, 3, i + 1)
+                plt.hist(anomaly_df[anomaly_df['is_anomaly'] == 0][feature], bins=20, alpha=0.5, label='Normal', color='green')
+                plt.hist(anomaly_df[anomaly_df['is_anomaly'] == 1][feature], bins=20, alpha=0.5, label='Anomalous', color='red')
+                plt.xlabel(feature)
+                plt.ylabel('Frequency')
+                plt.legend()
+            
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, 'feature_distribution.png'))
+            
+            logger.info(f"Visualizations saved to {output_dir}")
+        except Exception as e:
+            logger.error(f"Error visualizing results: {str(e)}")
+    
+    def save_results(self, anomaly_df, output_dir='reports'):
+        """
+        Save the results of the anomaly detection.
+        
+        Parameters:
+        -----------
+        anomaly_df : pd.DataFrame
+            DataFrame with anomaly scores for each user.
+        output_dir : str
+            Directory to save the results.
+        """
+        if anomaly_df.empty:
+            return
+            
+        try:
+            # Create output directory if it doesn't exist
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Save anomaly detection results
+            anomaly_df.to_csv(os.path.join(output_dir, 'anomaly_detection_results.csv'), index=False)
+            
+            # Save alerts
+            if self.alerts:
+                with open(os.path.join(output_dir, 'alerts.json'), 'w') as f:
+                    json.dump(self.alerts, f, indent=4)
+            
+            logger.info(f"Results saved to {output_dir}")
+        except Exception as e:
+            logger.error(f"Error saving results: {str(e)}")
+    
+    def run_analysis(self, data_file_path, output_dir='reports'):
+        """
+        Run the complete insider threat detection analysis.
+        
+        Parameters:
+        -----------
+        data_file_path : str
+            Path to the CSV file containing user activity data.
+        output_dir : str
+            Directory to save the results.
+            
+        Returns:
+        --------
+        pd.DataFrame
+            DataFrame with anomaly scores for each user.
+        """
+        logger.info("Starting insider threat detection analysis")
+        
+        # Load and preprocess data
+        raw_data = self.load_data(data_file_path)
+        if raw_data.empty:
+            logger.error("No data available for analysis")
+            return pd.DataFrame()
+            
+        preprocessed_data = self.preprocess_data(raw_data)
+        
+        # Extract features
+        feature_df = self.extract_features(preprocessed_data)
+        if feature_df.empty:
+            logger.error("Failed to extract features")
+            return pd.DataFrame()
+        
+        # Detect anomalies
+        anomaly_df = self.detect_anomalies(feature_df)
+        if anomaly_df.empty:
+            logger.error("Failed to detect anomalies")
+            return pd.DataFrame()
+        
+        # Generate alerts
+        self.generate_alerts(anomaly_df)
+        
+        # Visualize and save results
+        self.visualize_results(anomaly_df, output_dir)
+        self.save_results(anomaly_df, output_dir)
+        
+        logger.info("Insider threat detection analysis completed")
+        return anomaly_df
+
+# Example usage
+if __name__ == "__main__":
+    # Create a demo dataset if none exists
+    def create_demo_dataset(file_path="demo_data.csv", num_users=50, days=30):
+        """Create a demo dataset for testing."""
+        np.random.seed(42)
+        data = []
+        
+        actions = ['login', 'logout', 'file_access', 'email_sent', 'failed_login', 'sensitive_data_access']
+        
+        # Normal user behavior
+        for user_id in range(1, num_users + 1):
+            # Determine user's typical login time (9am with some variance)
+            typical_login_hour = 9 + np.random.normal(0, 1)
+            
+            for day in range(days):
+                current_date = datetime.now() - timedelta(days=days-day)
+                
+                # Login
+                login_time = current_date.replace(
+                    hour=int(typical_login_hour + np.random.normal(0, 0.5)),
+                    minute=np.random.randint(0, 60)
+                )
+                
+                data.append({
+                    'user_id': f"user_{user_id:03d}",
+                    'timestamp': login_time,
+                    'action': 'login',
+                    'resource': 'system'
+                })
+                
+                # Normal activities during the day
+                num_activities = np.random.randint(5, 15)
+                for _ in range(num_activities):
+                    activity_time = login_time + timedelta(hours=np.random.randint(0, 8))
+                    action = np.random.choice(actions[1:4])  # Regular actions
+                    
+                    data.append({
+                        'user_id': f"user_{user_id:03d}",
+                        'timestamp': activity_time,
+                        'action': action,
+                        'resource': f"resource_{np.random.randint(1, 20):02d}"
+                    })
+                
+                # Logout
+                logout_time = login_time + timedelta(hours=np.random.randint(7, 10))
+                data.append({
+                    'user_id': f"user_{user_id:03d}",
+                    'timestamp': logout_time,
+                    'action': 'logout',
+                    'resource': 'system'
+                })
+        
+        # Insert some anomalous behavior for 5 users
+        for user_id in np.random.choice(range(1, num_users + 1), 5, replace=False):
+            # Late night activity
+            for _ in range(np.random.randint(5, 10)):
+                day = np.random.randint(0, days)
+                current_date = datetime.now() - timedelta(days=days-day)
+                
+                activity_time = current_date.replace(
+                    hour=np.random.randint(22, 24),
+                    minute=np.random.randint(0, 60)
+                )
+                
+                action = np.random.choice(['file_access', 'sensitive_data_access'])
+                
+                data.append({
+                    'user_id': f"user_{user_id:03d}",
+                    'timestamp': activity_time,
+                    'action': action,
+                    'resource': f"resource_{np.random.randint(1, 20):02d}"
+                })
+            
+            # Failed login attempts
+            for _ in range(np.random.randint(3, 7)):
+                day = np.random.randint(0, days)
+                current_date = datetime.now() - timedelta(days=days-day)
+                
+                activity_time = current_date.replace(
+                    hour=np.random.randint(0, 24),
+                    minute=np.random.randint(0, 60)
+                )
+                
+                data.append({
+                    'user_id': f"user_{user_id:03d}",
+                    'timestamp': activity_time,
+                    'action': 'failed_login',
+                    'resource': 'system'
+                })
+        
+        # Create DataFrame and save to CSV
+        df = pd.DataFrame(data)
+        df.to_csv(file_path, index=False)
+        print(f"Demo dataset created with {len(df)} records")
+        return file_path
+    
+    # Create demo dataset if it doesn't exist
+    data_file = "demo_data.csv"
+    if not os.path.exists(data_file):
+        data_file = create_demo_dataset(data_file)
+    
+    # Initialize and run the analysis
+    uba = UserBehaviorAnalytics()
+    results = uba.run_analysis(data_file, "reports")
+    
+    # Print summary
+    if not results.empty:
+        print("\nSummary:")
+        print(f"Total users analyzed: {len(results)}")
+        print(f"Potential insider threats detected: {results['is_anomaly'].sum()}")
+        print(f"High-risk users: {len([a for a in uba.alerts if a['risk_level'] == 'High'])}")
+        
+        if uba.alerts:
+            print("\nTop alerts:")
+            for i, alert in enumerate(uba.alerts[:3]):
+                print(f"{i+1}. User {alert['user_id']} - Risk: {alert['risk_level']} - Score: {alert['anomaly_score']:.2f}")
+                print(f"   Unusual behaviors: {', '.join(alert['unusual_behaviors'])}")
